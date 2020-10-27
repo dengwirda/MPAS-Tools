@@ -2,11 +2,8 @@ from __future__ import absolute_import, division, print_function, \
     unicode_literals
 
 import numpy as np
-
 from netCDF4 import Dataset as NetCDFFile
-from mpas_tools.mesh.creation.util import circumcenter
-
-from jigsawpy import jigsaw_msh_t, loadmsh
+from jigsawpy import jigsaw_msh_t, loadmsh, pwrbal2
 
 import argparse
 
@@ -60,9 +57,15 @@ def jigsaw_to_netcdf(msh_filename, output_name, on_sphere, sphere_radius=None):
         yCell_full = msh.vert2['coord'][:, 1]
         zCell_full = np.zeros(nCells, dtype=float)
 
-    for cells in [xCell_full, yCell_full, zCell_full]:
-        assert cells.shape[0] == nCells, 'Number of anticipated nodes is ' \
-                                         'not correct!'
+    if msh.power.size > 0:
+        wCell_full = msh.power[:]
+    else:
+        wCell_full = np.zeros(nCells, dtype=float)
+
+    for cells in [xCell_full, yCell_full, zCell_full, wCell_full]:
+        assert cells.shape[0] == nCells, \
+            'Number of anticipated nodes is not correct!'
+
     if on_sphere:
         grid.on_a_sphere = "YES"
         grid.sphere_radius = sphere_radius
@@ -70,6 +73,7 @@ def jigsaw_to_netcdf(msh_filename, output_name, on_sphere, sphere_radius=None):
         xCell_full *= 1e3
         yCell_full *= 1e3
         zCell_full *= 1e3
+        wCell_full *= 1e6   # w = r^2
     else:
         grid.on_a_sphere = "NO"
         grid.sphere_radius = 0.0
@@ -80,29 +84,16 @@ def jigsaw_to_netcdf(msh_filename, output_name, on_sphere, sphere_radius=None):
         'cellsOnVertex_full is not the right shape!'
 
     # Create vertex variables
-    xVertex_full = np.zeros((nVertices,))
-    yVertex_full = np.zeros((nVertices,))
-    zVertex_full = np.zeros((nVertices,))
+    ball = pwrbal2(
+        np.hstack((xCell_full, yCell_full, zCell_full)),
+        wCell_full, cellsOnVertex_full - 1)
 
-    for iVertex in range(nVertices):
-        cell1 = cellsOnVertex_full[iVertex, 0]
-        cell2 = cellsOnVertex_full[iVertex, 1]
-        cell3 = cellsOnVertex_full[iVertex, 2]
+    if on_sphere:
+        ball = to_sphere(sphere_radius, ball)
 
-        x1 = xCell_full[cell1 - 1]
-        y1 = yCell_full[cell1 - 1]
-        z1 = zCell_full[cell1 - 1]
-        x2 = xCell_full[cell2 - 1]
-        y2 = yCell_full[cell2 - 1]
-        z2 = zCell_full[cell2 - 1]
-        x3 = xCell_full[cell3 - 1]
-        y3 = yCell_full[cell3 - 1]
-        z3 = zCell_full[cell3 - 1]
-
-        pv = circumcenter(on_sphere, x1, y1, z1, x2, y2, z2, x3, y3, z3)
-        xVertex_full[iVertex] = pv.x
-        yVertex_full[iVertex] = pv.y
-        zVertex_full[iVertex] = pv.z
+    xVertex_full = ball[:, 0]
+    yVertex_full = ball[:, 1]
+    zVertex_full = ball[:, 2]
 
     meshDensity_full = grid.createVariable(
         'meshDensity', 'f8', ('nCells',))
@@ -118,6 +109,8 @@ def jigsaw_to_netcdf(msh_filename, output_name, on_sphere, sphere_radius=None):
     var[:] = yCell_full
     var = grid.createVariable('zCell', 'f8', ('nCells',))
     var[:] = zCell_full
+    var = grid.createVariable('wCell', 'f8', ('nCells',))
+    var[:] = wCell_full
     var = grid.createVariable('featureTagCell', 'i4', ('nCells',))
     var[:] = msh.point['IDtag']
     var = grid.createVariable('xVertex', 'f8', ('nVertices',))
@@ -134,6 +127,57 @@ def jigsaw_to_netcdf(msh_filename, output_name, on_sphere, sphere_radius=None):
 
     grid.sync()
     grid.close()
+
+
+def to_sphere(radii, E3):
+    """
+    TO-SPHERE: project (geocentric) a set of points in R^3
+    onto a spheroidal surface.
+
+    """
+    # Authors: Darren Engwirda
+    
+    if (radii.size == 1):
+        radii = radii * np.ones(3, dtype=float)
+
+    PP = .5 * E3
+
+    ax = PP[:, 0] ** 1 / radii[0] ** 1
+    ay = PP[:, 1] ** 1 / radii[1] ** 1
+    az = PP[:, 2] ** 1 / radii[2] ** 1
+
+    aa = ax ** 2 + ay ** 2 + az ** 2
+
+    bx = PP[:, 0] ** 2 / radii[0] ** 2
+    by = PP[:, 1] ** 2 / radii[1] ** 2
+    bz = PP[:, 2] ** 2 / radii[2] ** 2
+
+    bb = bx * 2. + by * 2. + bz * 2.
+
+    cx = PP[:, 0] ** 1 / radii[0] ** 1
+    cy = PP[:, 1] ** 1 / radii[1] ** 1
+    cz = PP[:, 2] ** 1 / radii[2] ** 1
+
+    cc = cx ** 2 + cy ** 2 + cz ** 2
+    cc = cc - 1.0
+
+    ts = bb * bb - 4. * aa * cc
+
+    ok = ts >= .0
+
+    AA = aa[ok]; BB = bb[ok]; CC = cc[ok]; TS = ts[ok]
+
+    t1 = (-BB + np.sqrt(TS)) / AA / 2.0
+    t2 = (-BB - np.sqrt(TS)) / AA / 2.0
+
+    tt = np.maximum(t1, t2)
+    
+    P3 = np.zeros(E3.shape, dtype=float)
+    P3[ok, 0] = (1.0 + tt) * PP[ok, 0]
+    P3[ok, 1] = (1.0 + tt) * PP[ok, 1]
+    P3[ok, 2] = (1.0 + tt) * PP[ok, 2]
+
+    return P3
 
 
 def main():
